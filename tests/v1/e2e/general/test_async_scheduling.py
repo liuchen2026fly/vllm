@@ -190,6 +190,42 @@ def test_with_ngram_gpu_spec_decoding(monkeypatch: pytest.MonkeyPatch):
     run_tests(monkeypatch, MODEL, test_configs, [{}])
 
 
+def test_with_ngram_gpu_spec_decoding(monkeypatch: pytest.MonkeyPatch):
+    """Test ngram_gpu speculative decoding with different configurations.
+
+    This test specifically validates ngram_gpu behavior with various:
+    - Number of speculative tokens (2-6)
+    - Prompt lookup window sizes (min/max)
+    - Async scheduling enabled (as in production)
+    - Different executors and chunking settings
+    """
+
+    # Variant with larger speculation window
+    ngram_gpu_config = {
+        "method": "ngram_gpu",
+        "num_speculative_tokens": 3,
+        "prompt_lookup_max": 3,
+        "prompt_lookup_min": 2,
+    }
+
+    # Test configurations covering various scenarios
+    # test_preemption, executor, async_scheduling,
+    # spec_config, test_prefill_chunking
+    test_configs = [
+        (False, "mp", False, None, False),
+        (False, "mp", False, ngram_gpu_config, False),
+        (True, "mp", False, ngram_gpu_config, True),
+        (False, "mp", True, ngram_gpu_config, False),
+        (True, "mp", True, ngram_gpu_config, False),
+        (True, "uni", True, ngram_gpu_config, False),
+        (True, "mp", True, ngram_gpu_config, True),
+    ]
+
+    # Use MODEL (Qwen) for ngram_gpu tests as it's lighter weight
+    # and ngram_gpu doesn't require a specific draft model
+    run_tests(monkeypatch, MODEL, test_configs, [{}])
+
+
 @dynamo_config.patch(cache_size_limit=16)
 def run_tests(
     monkeypatch: pytest.MonkeyPatch,
