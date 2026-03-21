@@ -688,15 +688,17 @@ class VllmConfig:
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
-            # decoding.
+            # decoding and suffix/ngram.
             if self.speculative_config is not None:
-                if (
-                    self.speculative_config.method not in get_args(EagleModelTypes)
-                    and self.speculative_config.method != "draft_model"
-                ):
+                _async_sched_methods = (
+                    *get_args(EagleModelTypes), "draft_model",
+                    "suffix", "ngram",
+                )
+                if self.speculative_config.method not in _async_sched_methods:
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP/Draft Model kind of speculative decoding."
+                        "with EAGLE/MTP/Draft Model/Suffix/NGram kind of "
+                        "speculative decoding."
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
                     raise ValueError(
