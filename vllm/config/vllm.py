@@ -567,12 +567,17 @@ class VllmConfig:
                     "pipeline_parallel_size > 1."
                 )
             # Currently, async scheduling only support eagle speculative
-            # decoding.
+            # decoding and suffix/ngram.
             if self.speculative_config is not None:
-                if self.speculative_config.method not in get_args(EagleModelTypes):
+                _async_sched_methods = (
+                    *get_args(EagleModelTypes),
+                    "suffix", "ngram",
+                )
+                if self.speculative_config.method not in _async_sched_methods:
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP kind of speculative decoding."
+                        "with EAGLE/MTP/Suffix/NGram kind of "
+                        "speculative decoding."
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
                     raise ValueError(
