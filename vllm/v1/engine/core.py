@@ -498,17 +498,15 @@ class EngineCore:
             scheduler_output, model_output
         )
 
-        # For async scheduling with spec decode, take draft token ids
-        # once and use them for both scheduler state update and deferred
-        # output update.  Without this, suffix/ngram proposers produce
-        # draft tokens but they never reach the scheduler, so
-        # request.spec_token_ids stays empty and no speculation is
-        # scheduled.
+        # Take draft token ids for deferred structured-output path.
+        # NOTE: Do NOT call update_draft_token_ids() here for async
+        # scheduling — the AsyncScheduler already manages spec_token_ids
+        # via [-1] placeholders in _update_after_schedule, and the model
+        # runner replaces them with real drafts in _prepare_inputs.
+        # Calling update_draft_token_ids() would overwrite the [-1]*N
+        # with real tokens of potentially different length, breaking
+        # the placeholder accounting.
         draft_token_ids = None
-        if self.use_spec_decode:
-            draft_token_ids = self.model_executor.take_draft_token_ids()
-            if draft_token_ids is not None:
-                self.scheduler.update_draft_token_ids(draft_token_ids)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
