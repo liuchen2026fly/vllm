@@ -498,6 +498,18 @@ class EngineCore:
             scheduler_output, model_output
         )
 
+        # For async scheduling with spec decode, take draft token ids
+        # once and use them for both scheduler state update and deferred
+        # output update.  Without this, suffix/ngram proposers produce
+        # draft tokens but they never reach the scheduler, so
+        # request.spec_token_ids stays empty and no speculation is
+        # scheduled.
+        draft_token_ids = None
+        if self.use_spec_decode:
+            draft_token_ids = self.model_executor.take_draft_token_ids()
+            if draft_token_ids is not None:
+                self.scheduler.update_draft_token_ids(draft_token_ids)
+
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
@@ -506,7 +518,8 @@ class EngineCore:
             # we need to get the draft token ids from the prior step before
             # we can compute the grammar bitmask for the deferred request.
             if self.use_spec_decode:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
+                if draft_token_ids is None:
+                    draft_token_ids = self.model_executor.take_draft_token_ids()
                 assert draft_token_ids is not None
                 # Update the draft token ids in the scheduler output to
                 # filter out the invalid spec tokens, which will be padded

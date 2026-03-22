@@ -3553,9 +3553,16 @@ class GPUModelRunner(
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
-        # Check if we need to copy draft tokens to CPU. In async scheduling,
-        # we only copy when needed for structured output, penalties or bad_words.
-        if self.use_async_scheduling and not (
+        # Check if we need to copy draft tokens to CPU. In async scheduling
+        # with Eagle/MTP, we only copy when needed for structured output,
+        # penalties or bad_words (since Eagle/MTP handle drafts on GPU).
+        # For suffix/ngram, we always need CPU draft tokens so the engine
+        # can pass them to the scheduler via update_draft_token_ids().
+        needs_cpu_draft_tokens = (
+            self.speculative_config is not None
+            and self.speculative_config.method in ("suffix", "ngram")
+        )
+        if self.use_async_scheduling and not needs_cpu_draft_tokens and not (
             scheduler_output.has_structured_output_requests
             or self.input_batch.sampling_metadata.output_token_ids
         ):
