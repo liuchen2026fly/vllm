@@ -75,21 +75,16 @@ class MiniMaxM2ReasoningParser(BaseThinkingReasoningParser):
         return DeltaMessage(reasoning=delta_text)
 
 
-class MiniMaxM2AppendThinkReasoningParser(ReasoningParser):
+class MiniMaxM2AppendThinkReasoningParser(MiniMaxM2ReasoningParser):
     """
-    Reasoning parser for MiniMax M2 model.
+    Reasoning parser for MiniMax M2 model that appends <think> start token
+    to the reasoning content.
     """
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
         self.end_token_id = self.vocab.get("</think>")
-
-    def is_reasoning_end(self, input_ids: list[int]) -> bool:
-        end_token_id = self.end_token_id
-        return any(input_id == end_token_id for input_id in reversed(input_ids))
-
-    def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        return input_ids
+        self.start_token_id = self.vocab.get("<think>")
 
     def extract_reasoning_streaming(
         self,
@@ -100,11 +95,25 @@ class MiniMaxM2AppendThinkReasoningParser(ReasoningParser):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
     ) -> DeltaMessage | None:
-        if len(previous_token_ids) == 0:
-            delta_text = "<think>" + delta_text
-        return DeltaMessage(content=delta_text)
+        delta = super().extract_reasoning_streaming(
+            previous_text,
+            current_text,
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+        )
+
+        if delta and delta.reasoning:
+            if len(previous_token_ids) == 0:
+                delta.reasoning = "<think>" + delta.reasoning
+        return delta
 
     def extract_reasoning(
         self, model_output: str, request: ChatCompletionRequest | ResponsesRequest
     ) -> tuple[str | None, str | None]:
-        return None, "<think>" + model_output
+        if self.end_token not in model_output:
+            return "<think>" + model_output, None
+
+        reasoning, _, content = model_output.partition(self.end_token)
+        return "<think>" + reasoning, content or None
