@@ -286,10 +286,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             # step's multi stream).
             num_tokens = hidden_states.shape[0]
             hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-                num_tokens, hc_count, hidden_size
-            )
-            hidden_states = self.fc_hidden(hidden_states)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2))
+            hidden_states = self.fc_hidden(
+                hidden_states.reshape(-1, hidden_size)
+            ).reshape(num_tokens, hc_count, hidden_size)
             # Add the embedding residual to every branch, then fold back
             # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
             hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
