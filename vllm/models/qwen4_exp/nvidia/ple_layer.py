@@ -104,6 +104,31 @@ def _nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+
+def _depthwise_dilated_conv(
+    history: torch.Tensor, weights: torch.Tensor, dilation: int
+) -> torch.Tensor:
+    """Depthwise dilated conv without an aclop: ``history`` [B, C, L],
+    ``weights`` [C, K]; returns [B, C, L - dilation * (K - 1)].  Equivalent to
+    ``F.conv1d(history, weights.unsqueeze(1), groups=C, dilation=dilation)``,
+    accumulated in fp32.  Used where the graph capturer cannot record the
+    platform's conv kernel."""
+    taps = weights.shape[-1]
+    out_len = history.shape[-1] - dilation * (taps - 1)
+    acc = torch.zeros(
+        history.shape[0], history.shape[1], out_len, dtype=torch.float32, device=history.device
+    )
+    w = weights.float()
+    for j in range(taps):
+        acc = acc + history[..., j * dilation : j * dilation + out_len].float() * w[:, j].view(1, -1, 1)
+    return acc.to(history.dtype)
+
+
+def _short_conv_needs_taps() -> bool:
+    from vllm.platforms import current_platform
+
+    return not current_platform.is_cuda_alike()
+
 class Qwen4ExpPLEGroupedNorm(nn.Module):
     def __init__(
         self,
@@ -342,18 +367,21 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
-        num_reqs = query_start_loc.numel() - 1
+        num_reqs = query_start_loc.shape[0] - 1
         num_tokens = input_ids.shape[0]
-        if num_tokens > self.positions_buffer.numel():
-            raise ValueError(
-                f"PLE received {num_tokens} tokens, but its workspace supports "
-                f"at most {self.positions_buffer.numel()}"
-            )
-        if num_reqs > self.padded_buffer.shape[0]:
-            raise ValueError(
-                f"PLE received {num_reqs} requests, but its workspace supports "
-                f"at most {self.padded_buffer.shape[0]}"
-            )
+        # Branching on these sizes would specialise them, so only check when
+        # not tracing; the workspaces are sized from the engine's own limits.
+        if not torch.compiler.is_compiling():
+            if num_tokens > self.positions_buffer.numel():
+                raise ValueError(
+                    f"PLE received {num_tokens} tokens, but its workspace supports "
+                    f"at most {self.positions_buffer.numel()}"
+                )
+            if num_reqs > self.padded_buffer.shape[0]:
+                raise ValueError(
+                    f"PLE received {num_reqs} requests, but its workspace supports "
+                    f"at most {self.padded_buffer.shape[0]}"
+                )
 
         positions = self.positions_buffer[:num_tokens]
         packed = self.padded_buffer[:num_reqs]
@@ -650,12 +678,17 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         else:
             history = x_d.unsqueeze(-1)
 
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
-        ).squeeze(-1)
+        if _short_conv_needs_taps():
+            conv_output = _depthwise_dilated_conv(
+                history, conv_weights, self.short_conv_dilation
+            ).squeeze(-1)
+        else:
+            conv_output = F.conv1d(
+                history,
+                conv_weights.unsqueeze(1).contiguous(),
+                groups=history.size(1),
+                dilation=self.short_conv_dilation,
+            ).squeeze(-1)
         output = F.silu(conv_output)
         output = output * valid_state.view(-1, 1).to(output.dtype)
 
@@ -764,12 +797,17 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         else:
             history = packed_tokens
 
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
-        )
+        if _short_conv_needs_taps():
+            conv_output = _depthwise_dilated_conv(
+                history, conv_weights, self.short_conv_dilation
+            )
+        else:
+            conv_output = F.conv1d(
+                history,
+                conv_weights.unsqueeze(1).contiguous(),
+                groups=history.size(1),
+                dilation=self.short_conv_dilation,
+            )
         conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
 
         token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
@@ -899,12 +937,17 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         else:
             history = packed
 
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
-        )
+        if _short_conv_needs_taps():
+            conv_output = _depthwise_dilated_conv(
+                history, conv_weights, self.short_conv_dilation
+            )
+        else:
+            conv_output = F.conv1d(
+                history,
+                conv_weights.unsqueeze(1).contiguous(),
+                groups=history.size(1),
+                dilation=self.short_conv_dilation,
+            )
         conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
 
         output = conv_output[pack_req_indices, pack_col_indices]
