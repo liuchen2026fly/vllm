@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import cast
 
 import torch
+from vllm.platforms import current_platform
 from torch import nn
 
 from vllm.config import VllmConfig
@@ -55,7 +56,10 @@ def apply_qsa_rope(
         )
         return tensor.reshape(shape)
 
-    rotated = rotary_emb.apply_rotary_emb.forward_cuda(
+    apply = rotary_emb.apply_rotary_emb
+    # forward_cuda imports vllm_flash_attn; other platforms take the torch path.
+    rope_fn = apply.forward_cuda if current_platform.is_cuda_alike() else apply.forward_native
+    rotated = rope_fn(
         tensor[..., :rotary_dim],
         cos,
         sin,
@@ -185,7 +189,10 @@ class QSAIndexer(nn.Module):
         )
         if raw.num_actual_tokens != compressed.num_actual_tokens:
             raise RuntimeError("QSA side-cache metadata token counts disagree")
-        if not raw.logical_positions.is_cuda and (
+        # torch.equal synchronises the device, which is illegal mid graph
+        # capture; keep this a CPU-only debug check (the `is_cuda` test this
+        # replaces let it run on every non-CUDA accelerator).
+        if raw.logical_positions.device.type == "cpu" and (
             not torch.equal(raw.logical_positions, compressed.logical_positions)
         ):
             raise RuntimeError("QSA side-cache metadata positions disagree")
@@ -271,13 +278,16 @@ class QSAIndexer(nn.Module):
             )
         else:
             # Unfused reference path
-            from flashinfer.norm import gemma_rmsnorm
+            from .ops.hc import grouped_gemma_rmsnorm
 
             q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
-            q = gemma_rmsnorm(
+            # num_groups=1 -> a single RMS reduction over the head dimension,
+            # i.e. plain Gemma RMSNorm.
+            q = grouped_gemma_rmsnorm(
                 q.reshape(-1, self.index_head_dim),
                 self.q_layernorm.weight,
                 self.q_layernorm.variance_epsilon,
+                1,
             ).reshape_as(q)
             q = apply_qsa_rope(self.rotary_emb, positions, q)
 
@@ -303,10 +313,11 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 rope_position_cache,
             )
-            compressed_keys = gemma_rmsnorm(
+            compressed_keys = grouped_gemma_rmsnorm(
                 pooled.reshape(-1, self.index_head_dim),
                 self.k_layernorm.weight,
                 self.k_layernorm.variance_epsilon,
+                1,
             ).reshape(-1, 1, self.index_head_dim)
             if getattr(self.rotary_emb, "mrope_section", None):
                 first_positions = first_positions.transpose(0, 1)

@@ -468,6 +468,12 @@ def hc_combine_norm(
     eps: float,
     hc_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not current_platform.is_cuda_alike():
+        # The fused kernel's masked tile load computes addresses past the end of
+        # a row; CUDA discards them, other backends' transfer engines may not.
+        # Same result from the two unfused kernels.
+        combined = hc_combine(residual, block_output, injection_logits, hc_count)
+        return combined, grouped_gemma_rmsnorm(combined, norm_weight, eps, hc_count)
     return torch.ops.vllm.qwen4_exp_hc_combine_norm(
         residual,
         block_output,

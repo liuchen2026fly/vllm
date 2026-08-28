@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+
+from ...common.portable_topk import topk_per_row as portable_topk_per_row
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -593,6 +596,19 @@ def _validate_mqa(q: torch.Tensor) -> None:
         raise ValueError("QSA query must be [rows, heads, head_dim]")
 
 
+def _on_triton_device(t: torch.Tensor) -> bool:
+    """True when ``t`` lives on the accelerator this process drives and Triton
+    is importable.  Replaces an ``is_cuda`` test so non-CUDA Triton backends
+    (e.g. Ascend NPU) are not excluded on device type alone."""
+    return HAS_TRITON and t.device.type == current_platform.device_type
+
+
+@functools.lru_cache(maxsize=1)
+def _has_native_topk() -> bool:
+    """Whether this build compiled the C++ radix top-k operators."""
+    return hasattr(torch.ops._C, "persistent_topk")
+
+
 def qsa_mqa_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -607,7 +623,7 @@ def qsa_mqa_paged(
     """Compute QSA scores directly from a paged compressed-key cache."""
 
     _validate_mqa(q)
-    if not q.is_cuda or not HAS_TRITON:
+    if not _on_triton_device(q):
         raise RuntimeError("paged QSA scoring requires CUDA and Triton")
     if k_cache.ndim != 4 or k_cache.shape[2] != 1:
         raise ValueError("QSA cache must be [pages, page_size, 1, head_dim]")
@@ -693,7 +709,7 @@ def expand_qsa_block_indices_cuda(
 ) -> torch.Tensor:
     """Expand compressed blocks and compact the causal tail of the open group."""
 
-    if not block_indices.is_cuda or not HAS_TRITON:
+    if not _on_triton_device(block_indices):
         raise RuntimeError("QSA CUDA expansion requires Triton")
     if token_topk % compress_ratio:
         raise ValueError("QSA token top-k must be divisible by compression ratio")
@@ -791,12 +807,17 @@ def qsa_select_paged_tokens(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        topk_op = (
-            torch.ops._C.cooperative_topk
-            if use_cooperative_topk
-            else torch.ops._C.persistent_topk
-        )
-        topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
+        if _has_native_topk():
+            topk_op = (
+                torch.ops._C.cooperative_topk
+                if use_cooperative_topk
+                else torch.ops._C.persistent_topk
+            )
+            topk_op(
+                logits, visible_blocks, blocks, topk_workspace, block_topk, columns
+            )
+        else:
+            portable_topk_per_row(logits, visible_blocks, blocks, block_topk)
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
@@ -820,7 +841,7 @@ def qsa_sparse_paged_attention(
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches."""
 
-    if not q.is_cuda or not HAS_TRITON:
+    if not _on_triton_device(q):
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -959,7 +980,7 @@ def qsa_store_cache_rows(
 ) -> None:
     """Store fixed-width rows in a QSA cache without boolean indexing."""
 
-    if not cache.is_cuda or not HAS_TRITON:
+    if not _on_triton_device(cache):
         raise RuntimeError("QSA CUDA cache stores require Triton")
     if cache.ndim != 4 or cache.shape[2] != 1:
         raise ValueError("QSA cache must be [pages, page_size, 1, width]")
@@ -1005,7 +1026,7 @@ def qsa_compress_groups_with_ratio(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool completed groups from the compressor-state ring and raw token rows."""
 
-    if not raw_keys.is_cuda or not HAS_TRITON:
+    if not _on_triton_device(raw_keys):
         raise RuntimeError("QSA CUDA compression requires Triton")
     rows = token_to_req.numel()
     if compress_ratio <= 0:

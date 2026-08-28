@@ -119,9 +119,16 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
 
 @functools.cache
 def get_available_device() -> str:
+    """Best-effort probe of the Triton backend name.
+
+    Any failure means "we cannot tell from here" -- typically because this
+    process has no accelerator context at all (vLLM's architecture-inspection
+    subprocess is exactly that case).  Falling back to "cpu" keeps module import
+    side-effect free; callers that need a real device query it later.
+    """
     try:
         return triton.runtime.driver.active.get_current_target().backend
-    except (RuntimeError, AttributeError):
+    except Exception:
         return "cpu"
 
 
