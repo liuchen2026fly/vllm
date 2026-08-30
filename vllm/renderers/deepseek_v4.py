@@ -28,6 +28,14 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
         self._apply_chat_template_async = make_async(
             self._apply_chat_template, executor=self._executor
         )
+        self._arm_chat_cache_with(
+            lambda c: self._apply_chat_template(
+                conversation=c, messages=c, tokenize=True
+            ),
+            lambda c: self._apply_chat_template(
+                conversation=c, messages=c, tokenize=False
+            ),
+        )
 
     def _apply_chat_template(self, *args, **kwargs):
         return self.get_tokenizer().apply_chat_template(*args, **kwargs)
@@ -45,10 +53,11 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
-        prompt_raw = self._apply_chat_template(
-            conversation=conversation,
-            messages=messages,
-            **params.get_apply_chat_template_kwargs(),
+        prompt_raw = self._chat_render_cached(
+            params.get_apply_chat_template_kwargs(),
+            lambda **kw: self._apply_chat_template(
+                conversation=conversation, messages=messages, **kw
+            ),
         )
 
         prompt = parse_dec_only_prompt(prompt_raw)
@@ -72,10 +81,11 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
-        prompt_raw = await self._apply_chat_template_async(
-            conversation=conversation,
-            messages=messages,
-            **params.get_apply_chat_template_kwargs(),
+        prompt_raw = await self._chat_render_cached_async(
+            params.get_apply_chat_template_kwargs(),
+            lambda **kw: self._apply_chat_template_async(
+                conversation=conversation, messages=messages, **kw
+            ),
         )
 
         prompt = parse_dec_only_prompt(prompt_raw)

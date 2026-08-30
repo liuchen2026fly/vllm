@@ -382,6 +382,25 @@ class ModelConfig:
     The offline `LLM` entrypoint uses the synchronous renderer path and
     processes prompts (including multimodal preprocessing) serially, so
     this setting has no effect there."""
+    tokenizer_cache_gb: float = 0
+    """Size of the incremental tokenizer cache, in GiB. `0` (the default)
+    disables it.
+
+    The cache stores tokenization results per *segment*, where segments are
+    delimited by the tokenizer's added/special tokens. Conversations that
+    re-send a shared prefix each turn — agent transcripts, multi-turn coding
+    sessions — then only tokenize the newly appended suffix, which is the
+    part prefix caching cannot help with because token ids must be known
+    before the KV cache can be consulted.
+
+    The cache serves a request only when the tokenization is provably
+    identical to the uncached result; anything else falls through to a plain
+    tokenizer call. On startup the concatenation identity is verified against
+    a probe corpus, and the cache disables itself if it does not hold for the
+    tokenizer in use.
+
+    The cache is per API-server process, so total memory is
+    `tokenizer_cache_gb * api_server_count`."""
 
     # Pooler config
     pooler_config: PoolerConfig | None = None

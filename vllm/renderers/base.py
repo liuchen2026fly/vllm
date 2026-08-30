@@ -40,6 +40,7 @@ from vllm.multimodal.parse import (
 from vllm.multimodal.processing import BaseMultiModalProcessor
 from vllm.multimodal.processing import ProcessorInputs as MMProcessorInputs
 from vllm.multimodal.registry import MultiModalTimingRegistry
+from vllm.renderers.tokenizer_cache import IncrementalTokenizerCache
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import make_async
 from vllm.utils.counter import AtomicCounter
@@ -104,6 +105,15 @@ class BaseRenderer(ABC, Generic[_T]):
         # warmup already ran even after reset_mm_cache joined it first, and
         # avoid running warmup_mm a second time.
         self._mm_warmup_done: bool = False
+        # Segment-level tokenizer cache. Off unless --tokenizer-cache-gb > 0.
+        # It self-checks at construction and disables itself if the segment
+        # concatenation identity does not hold for this tokenizer.
+        self._tokenizer_cache: IncrementalTokenizerCache | None = None
+        tokenizer_cache_gb = config.model_config.tokenizer_cache_gb
+        if tokenizer_cache_gb > 0 and tokenizer is not None:
+            cache = IncrementalTokenizerCache(tokenizer, tokenizer_cache_gb)
+            if cache.enabled:
+                self._tokenizer_cache = cache
 
         # Thread pool executor for blocking tokenizer operations.  The
         # multimodal processor receives a deep-copied tokenizer (see #36557)
@@ -589,12 +599,112 @@ class BaseRenderer(ABC, Generic[_T]):
         kwargs = params.get_encode_kwargs()
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
+        if not want_offsets:
+            token_ids = self._maybe_tokenize_cached(prompt["prompt"], kwargs)
+            if token_ids is not None:
+                return self._build_tokens_prompt(token_ids, prompt)
+
         encoding = tokenizer(prompt["prompt"], **kwargs)
         return self._build_tokens_prompt(
             encoding["input_ids"],
             prompt,
             offset_mapping=encoding["offset_mapping"] if want_offsets else None,
         )
+
+    def _chat_cache_usable(self, chat_template_kwargs: dict[str, Any]) -> bool:
+        """The chat fast path applies only to plain, fully-tokenized renders."""
+        cache = self._tokenizer_cache
+        return (
+            cache is not None
+            and cache.chat_path_enabled
+            and chat_template_kwargs.get("tokenize", True) is not False
+            and not getattr(self, "use_unified_vision_chunk", False)
+        )
+
+    def _chat_render_cached(self, chat_kwargs, render):
+        """Render a chat prompt through the tokenizer cache when it applies.
+
+        Args:
+            chat_kwargs: `apply_chat_template` kwargs for this request.
+            render: Callable accepting those kwargs; returns text or token ids.
+
+        Returns:
+            Token ids on the fast path, otherwise whatever `render` returns.
+        """
+        if self._chat_cache_usable(chat_kwargs):
+            text = render(**{**chat_kwargs, "tokenize": False})
+            return self._tokenizer_cache.encode(text)
+        return render(**chat_kwargs)
+
+    async def _chat_render_cached_async(self, chat_kwargs, render):
+        """Async counterpart of `_chat_render_cached`."""
+        if self._chat_cache_usable(chat_kwargs):
+            text = await render(**{**chat_kwargs, "tokenize": False})
+            return self._tokenizer_cache.encode(text)
+        return await render(**chat_kwargs)
+
+    def _arm_chat_cache_with(self, render_fused, render_text) -> None:
+        """Arm the chat fast path using renderer-supplied render callables.
+
+        Args:
+            render_fused: Renders a conversation straight to token ids.
+            render_text: Renders the same conversation to its prompt string.
+        """
+        cache = self._tokenizer_cache
+        if cache is None:
+            return
+
+        convs = [
+            [{"role": "user", "content": "a"}],
+            [
+                {"role": "user", "content": "hello there\nsecond line"},
+                {"role": "assistant", "content": "def f(x):\n    return x\n"},
+                {"role": "user", "content": "你好 \U0001f30f  trailing   "},
+            ],
+        ]
+        probes = []
+        try:
+            for conv in convs:
+                probes.append((render_text(conv), render_fused(conv)))
+        except Exception:
+            logger.debug("chat fast path probe failed", exc_info=True)
+            return
+
+        cache.arm_chat_path(probes)
+
+    def _maybe_tokenize_cached(
+        self,
+        text: str,
+        kwargs: dict[str, Any],
+    ) -> list[int] | None:
+        """Tokenize via the segment cache, or `None` if it does not apply.
+
+        Returning `None` means the caller must fall back to the plain
+        tokenizer call, so an ineligible request is bit-identical to the
+        uncached path.
+        """
+        cache = self._tokenizer_cache
+        if cache is None:
+            return None
+        if not cache.is_eligible(
+            add_special_tokens=kwargs.get("add_special_tokens", True)
+        ):
+            return None
+
+        token_ids = cache.encode(text)
+
+        max_length = kwargs.get("max_length")
+        if (
+            kwargs.get("truncation")
+            and max_length is not None
+            and len(token_ids) > max_length
+        ):
+            # The tokenizer would have truncated this. Defer to it rather than
+            # reimplementing its truncation semantics; over-length prompts are
+            # rejected downstream anyway, so this path is cold.
+            return None
+
+        return token_ids
 
     def _detokenize_prompt(self, prompt: TokensPrompt) -> TokensPrompt:
         tokenizer = self.get_tokenizer()

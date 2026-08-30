@@ -1008,9 +1008,30 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         )
 
         if self.tokenizer is not None:
+            self._arm_chat_cache(config.model_config)
             maybe_make_thread_pool(
                 self.tokenizer, config.model_config.renderer_num_workers + 1
             )
+
+    def _arm_chat_cache(self, model_config: ModelConfig) -> None:
+        """Verify the chat fast path against this model's own chat template."""
+        cache = self._tokenizer_cache
+        if cache is None or getattr(self.tokenizer, "chat_template", None) is None:
+            return
+
+        def render(conv, *, tokenize: bool):
+            return safe_apply_chat_template(
+                model_config,
+                self.tokenizer,
+                conv,
+                tokenize=tokenize,
+                add_generation_prompt=True,
+            )
+
+        self._arm_chat_cache_with(
+            lambda conv: render(conv, tokenize=True),
+            lambda conv: render(conv, tokenize=False),
+        )
 
     def _can_produce_offsets(self) -> bool:
         # HF tokenizers may be slow (use_fast=False); only fast tokenizers
@@ -1074,11 +1095,11 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 **chat_template_kwargs,
             )
         else:
-            prompt_raw = safe_apply_chat_template(
-                model_config,
-                tokenizer,
-                conversation,
-                **chat_template_kwargs,
+            prompt_raw = self._chat_render_cached(
+                chat_template_kwargs,
+                lambda **kw: safe_apply_chat_template(
+                    model_config, tokenizer, conversation, **kw
+                ),
             )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
@@ -1199,11 +1220,11 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             prompt_raw: str | list[int] = result_with_mask[0]
             assistant_tokens_mask = result_with_mask[1]
         else:
-            prompt_raw = await self._apply_chat_template_async(
-                model_config,
-                tokenizer,
-                conversation,
-                **chat_template_kwargs,
+            prompt_raw = await self._chat_render_cached_async(
+                chat_template_kwargs,
+                lambda **kw: self._apply_chat_template_async(
+                    model_config, tokenizer, conversation, **kw
+                ),
             )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
